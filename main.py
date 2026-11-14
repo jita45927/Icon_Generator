@@ -5,6 +5,9 @@ PNG 转 Windows ICO 图标生成器
 
 核心功能:
   - 智能居中裁剪(将非正方形图片裁剪为正方形)
+  - 应用裁剪(确认裁剪区域后写回图片,可先不生成 ICO)
+  - 圆角 Alpha(给裁剪后的图片叠加透明圆角通道)
+  - 选择透明区域(吸管取色,向四周扩散连通区域并置为透明,可多次点击加选)
   - 多尺寸打包(16x16 ~ 256x256 标准尺寸合并为单一 ICO)
   - 透明通道保留(完美处理 PNG Alpha 通道)
   - 拖拽载入与点击选择(所见即所得预览)
@@ -15,12 +18,14 @@ PNG 转 Windows ICO 图标生成器
   - main()            : 程序入口
 """
 
+import io
 import os
+import struct
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
-from PIL import Image, ImageDraw, ImageTk
+from PIL import Image, ImageChops, ImageDraw, ImageTk
 
 # ============================================================================
 # LANCZOS 重采样常量(兼容 Pillow 9.x 与 10.x)
@@ -29,8 +34,12 @@ from PIL import Image, ImageDraw, ImageTk
 # ============================================================================
 try:
     LANCZOS = Image.Resampling.LANCZOS
+    NEAREST = Image.Resampling.NEAREST
+    FLIP_TOP_BOTTOM = Image.Transpose.FLIP_TOP_BOTTOM
 except AttributeError:
     LANCZOS = Image.LANCZOS
+    NEAREST = Image.NEAREST
+    FLIP_TOP_BOTTOM = Image.FLIP_TOP_BOTTOM
 
 # ============================================================================
 # 拖拽支持(tkinterdnd2,可选依赖)
@@ -70,6 +79,12 @@ class IconGenerator:
 
     # Windows 标准图标尺寸列表(从小到大)
     SIZES = [(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+
+    # 圆角半径占图片边长的比例(用于"添加圆角Alpha")
+    CORNER_RADIUS_RATIO = 0.2
+
+    # "选择透明区域"的颜色容差(按最大通道差计算,0-255)
+    ALPHA_PICK_TOLERANCE = 32
 
     # 超大图片保护阈值:任一边超过此值则触发等比缩小
     MAX_INPUT_DIM = 5000
@@ -131,6 +146,102 @@ class IconGenerator:
         size = max(1, min(size, w - x, h - y))
         return img.crop((x, y, x + size, y + size))
 
+    def apply_rounded_alpha(self, img, radius_ratio=None):
+        """
+        给正方形图片叠加圆角 Alpha 通道
+          1. 按边长比例计算圆角半径
+          2. 以 4 倍超采样绘制蒙版后缩小,得到平滑的抗锯齿边缘
+          3. 与原图 Alpha 相乘,保留图片自带的透明区域
+        参数:
+          img         : PIL Image
+          radius_ratio: 圆角半径占边长的比例,None 则使用默认值
+        返回:
+          PIL.Image (RGBA)
+        """
+        if radius_ratio is None:
+            radius_ratio = self.CORNER_RADIUS_RATIO
+
+        img = img.convert("RGBA")
+        w, h = img.size
+        radius = max(1, int(round(min(w, h) * radius_ratio)))
+
+        # 超采样绘制圆角蒙版,缩小后边缘更平滑
+        scale = 4
+        mask = Image.new("L", (w * scale, h * scale), 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle(
+            [0, 0, w * scale - 1, h * scale - 1],
+            radius=radius * scale,
+            fill=255
+        )
+        mask = mask.resize((w, h), LANCZOS)
+
+        # 与原 Alpha 相乘,避免覆盖图片已有透明区域
+        alpha = ImageChops.multiply(img.getchannel("A"), mask)
+        img.putalpha(alpha)
+        return img
+
+    def build_transparent_region(self, img, xy, tolerance=None):
+        """
+        从种子点向外扩散,返回与种子颜色相近且连通的区域蒙版
+          - 与"全局同色替换"不同:只处理连通区域,遇到封闭边界即停止
+          - 颜色相似度按 RGB 最大通道差判断
+        参数:
+          img      : PIL Image
+          xy       : 种子点坐标 (x, y)
+          tolerance: 颜色容差(0-255),None 则使用默认值
+        返回:
+          PIL.Image (L 模式,255 表示选中区域,0 表示未选中)
+        """
+        if tolerance is None:
+            tolerance = self.ALPHA_PICK_TOLERANCE
+
+        rgb = img.convert("RGB")
+        w, h = rgb.size
+        x = max(0, min(int(xy[0]), w - 1))
+        y = max(0, min(int(xy[1]), h - 1))
+        seed = rgb.getpixel((x, y))
+
+        # 逐通道计算与种子色的差值,取其最大值作为颜色距离
+        r, g, b = rgb.split()
+        diff = ImageChops.difference(r, Image.new("L", rgb.size, seed[0]))
+        for chan, value in ((g, seed[1]), (b, seed[2])):
+            diff = ImageChops.lighter(
+                diff,
+                ImageChops.difference(chan, Image.new("L", rgb.size, value))
+            )
+
+        # 阈值化为二值图:255 表示颜色与种子相近
+        similar = diff.point(lambda v: 255 if v <= tolerance else 0)
+
+        # 在二值图上做连通填充(阈值为 0,只扩散到相近像素),128 为临时标记色
+        ImageDraw.floodfill(similar, (x, y), 128, thresh=0)
+
+        # 取出被标记的连通区域
+        return similar.point(lambda v: 255 if v == 128 else 0)
+
+    def apply_region_alpha(self, img, region_mask, offset=(0, 0)):
+        """
+        把指定区域设为完全透明(Alpha 置 0),用于"选择透明区域"
+        参数:
+          img        : PIL Image
+          region_mask: L 模式蒙版(255 表示透明区域)
+          offset     : 蒙版在 img 中的左上角偏移
+        返回:
+          PIL.Image (RGBA)
+        """
+        img = img.convert("RGBA")
+        # 将区域蒙版铺回整图坐标
+        full_mask = Image.new("L", img.size, 0)
+        full_mask.paste(region_mask, offset)
+
+        # 区域内的 Alpha 置 0,区域外保持原有 Alpha
+        alpha = Image.composite(
+            Image.new("L", img.size, 0), img.getchannel("A"), full_mask
+        )
+        img.putalpha(alpha)
+        return img
+
     def generate_icon_sizes(self, img_cropped):
         """
         根据裁剪后的正方形图片生成多尺寸列表
@@ -149,47 +260,114 @@ class IconGenerator:
             result.append(resized)
         return result
 
-    def generate_ico(self, input_path, output_path, crop_region=None):
+    @staticmethod
+    def _encode_png_layer(img):
         """
-        完整 ICO 生成流程:载入 -> 裁剪 -> 多尺寸 -> 保存为 ICO
+        将单张图像编码为 PNG 图层数据(用于 256x256)
+        PNG 体积远小于 BMP,且 Windows Vista 及以上原生支持
+        """
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    @staticmethod
+    def _encode_bmp_layer(img):
+        """
+        将单张图像编码为 ICO 内的 32bpp BMP 图层数据(用于 128 及以下)
+          - BITMAPINFOHEADER:biHeight 必须为实际高度的 2 倍
+            (上半部分为 XOR 位图,下半部分为 AND mask)
+          - XOR 位图:BGRA 顺序、行序自下而上
+          - AND mask:1 表示完全透明,行序自下而上,每行按 4 字节对齐
+        这是兼容性最好的图标图层格式,所有 Windows API 与外壳路径都能正确处理
+        """
+        img = img.convert("RGBA")
+        w, h = img.size
+        r, g, b, a = img.split()
+
+        # XOR 位图:RGB 通道换为 BGRA,再垂直翻转
+        bgra = Image.merge("RGBA", (b, g, r, a))
+        xor_data = bgra.transpose(FLIP_TOP_BOTTOM).tobytes()
+
+        # AND mask:仅 alpha==0 的像素置 1(完全透明)
+        alpha_bytes = a.tobytes()
+        stride = ((w + 31) // 32) * 4
+        mask_data = bytearray()
+        for y in range(h - 1, -1, -1):
+            row = bytearray(stride)
+            base = y * w
+            for x in range(w):
+                if alpha_bytes[base + x] == 0:
+                    row[x >> 3] |= 0x80 >> (x & 7)
+            mask_data += row
+
+        header = struct.pack(
+            "<IiiHHIIiiII",
+            40,                                # biSize
+            w,                                 # biWidth
+            h * 2,                             # biHeight(XOR + AND mask)
+            1,                                 # biPlanes
+            32,                                # biBitCount
+            0,                                 # biCompression = BI_RGB
+            len(xor_data) + len(mask_data),    # biSizeImage
+            0, 0, 0, 0                         # 分辨率/调色板字段
+        )
+        return header + xor_data + bytes(mask_data)
+
+    def generate_ico(self, img, output_path):
+        """
+        将处理好的正方形图片打包为多尺寸 ICO
+        图层格式(兼容性优先):
+          - 256x256      : PNG 压缩(体积小)
+          - 128 及以下   : 32bpp BMP + 1-bit AND mask(全平台兼容)
         参数:
-          input_path  : 输入图片路径
+          img         : PIL Image(RGBA),应已裁剪为正方形并叠加好 Alpha
           output_path : 输出 ICO 文件路径
-          crop_region : 自定义裁剪区域 (x, y, size)，None则使用居中裁剪
         返回:
           list[tuple[int, int]] 实际生成的尺寸列表
         """
-        # 1. 载入并预处理
-        img = self.load_image(input_path)
-        # 2. 裁剪为正方形(自定义或居中)
-        if crop_region is not None:
-            x, y, size = crop_region
-            img_cropped = self.custom_crop_square(img, x, y, size)
-        else:
-            img_cropped = self.center_crop_square(img)
-        # 3. 生成多尺寸列表
-        icon_images = self.generate_icon_sizes(img_cropped)
+        # 1. 生成多尺寸列表
+        icon_images = self.generate_icon_sizes(img)
 
-        # 兜底:若所有尺寸都被跳过(理论上不会,因为最小 16x16),使用裁剪图
+        # 兜底:若所有尺寸都被跳过(理论上不会,因为最小 16x16),使用原图
         if not icon_images:
-            icon_images = [img_cropped]
+            icon_images = [img]
 
-        # 4. 使用 Pillow 多图层打包保存为 ICO
-        #    重要:Pillow 的 ICO 插件以第一个图像的尺寸作为上限,
-        #    会跳过所有大于第一个图像尺寸的目标尺寸。
-        #    因此必须按尺寸降序排列,让最大的图像排在第一位,
-        #    这样所有较小尺寸才不会被跳过。
+        # 按尺寸降序排列,便于系统优先取大尺寸
         icon_images.sort(key=lambda im: im.size[0], reverse=True)
-        #    第一个图像作为基础,其余通过 append_images 追加
-        #    sizes 参数显式声明每个图层的尺寸
-        icon_images[0].save(
-            output_path,
-            format='ICO',
-            append_images=icon_images[1:],
-            sizes=[(img.width, img.height) for img in icon_images]
-        )
 
-        return [(img.width, img.height) for img in icon_images]
+        # 2. 逐尺寸编码图层(Pillow 的 ICO 保存不支持按尺寸混用格式,故手动组装)
+        layers = []
+        for im in icon_images:
+            im = im.convert("RGBA")
+            if max(im.size) >= 256:
+                data = self._encode_png_layer(im)
+            else:
+                data = self._encode_bmp_layer(im)
+            layers.append((im.size, data))
+
+        # 3. 组装 ICONDIR + ICONDIRENTRY 列表 + 图层数据
+        count = len(layers)
+        header = struct.pack("<HHH", 0, 1, count)   # reserved / type=1(ICON) / count
+        offset = 6 + 16 * count                     # 图层数据的起始偏移
+        directory = b""
+        for (w, h), data in layers:
+            directory += struct.pack(
+                "<BBBBHHII",
+                w & 0xFF,      # 宽(256 写 0)
+                h & 0xFF,      # 高(256 写 0)
+                0,             # 调色板颜色数(真彩色为 0)
+                0,             # 保留字段
+                1,             # 色彩平面数
+                32,            # 每像素位数
+                len(data),     # 图层数据长度
+                offset         # 图层数据偏移
+            )
+            offset += len(data)
+
+        with open(output_path, "wb") as f:
+            f.write(header + directory + b"".join(data for _, data in layers))
+
+        return [size for size, _ in layers]
 
     @staticmethod
     def is_image_file(file_path):
@@ -272,6 +450,13 @@ class IconGeneratorApp(BaseWindow):
         # 图片在Canvas上的偏移(居中显示)
         self.image_offset_x = 0
         self.image_offset_y = 0
+
+        # 选择透明区域(吸管模式)状态
+        self.pick_mode = False              # 是否处于吸管取色模式
+        self.pending_region_mask = None     # 待确认的区域蒙版(裁剪图尺寸)
+        self.pending_region_offset = (0, 0) # 该蒙版在 current_image 中的偏移
+        self.pending_seeds = []             # 已点击的种子点列表(支持加选)
+        self._tolerance_job = None          # 容差滑动时的延迟重算任务
 
         # ===== 构建 UI(从上到下)=====
         self._build_title()         # 1. 标题区
@@ -367,14 +552,21 @@ class IconGeneratorApp(BaseWindow):
         )
         self.effect_label.pack(expand=True)
 
+        # 吸管模式:点击效果预览取色
+        self.effect_label.bind("<Button-1>", self.on_effect_click)
+
     def _build_action_area(self):
-        """构建操作区:三个按钮(选择图片 / 重置裁剪 / 生成 ICO 文件)"""
+        """构建操作区:第一行编辑按钮,第二行透明区域与生成 ICO,第三行确认操作"""
         self.action_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.action_frame.pack(fill="x", padx=20, pady=(0, 10))
 
+        # ---------- 第一行:选择/裁剪/圆角相关操作 ----------
+        edit_frame = ctk.CTkFrame(self.action_frame, fg_color="transparent")
+        edit_frame.pack(fill="x", pady=(0, 8))
+
         # "选择图片" 按钮
         self.select_btn = ctk.CTkButton(
-            self.action_frame, text="选择图片",
+            edit_frame, text="选择图片",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=40, command=self.on_select_image
         )
@@ -382,20 +574,88 @@ class IconGeneratorApp(BaseWindow):
 
         # "重置裁剪" 按钮
         self.reset_crop_btn = ctk.CTkButton(
-            self.action_frame, text="重置裁剪",
+            edit_frame, text="重置裁剪",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=40, command=self.on_reset_crop,
             fg_color="#6C757D", hover_color="#5A6268"
         )
         self.reset_crop_btn.pack(side="left", expand=True, fill="x", padx=(0, 8))
 
+        # "应用裁剪" 按钮:把裁剪区域写回图片,不生成 ICO
+        self.apply_crop_btn = ctk.CTkButton(
+            edit_frame, text="应用裁剪",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=40, command=self.on_apply_crop
+        )
+        self.apply_crop_btn.pack(side="left", expand=True, fill="x", padx=(0, 8))
+
+        # "添加圆角Alpha" 按钮:先应用裁剪,再叠加圆角透明通道
+        self.rounded_alpha_btn = ctk.CTkButton(
+            edit_frame, text="添加圆角Alpha",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=40, command=self.on_apply_rounded_alpha
+        )
+        self.rounded_alpha_btn.pack(side="left", expand=True, fill="x", padx=(8, 0))
+
+        # ---------- 第二行:选择透明区域 + 生成 ICO 文件 ----------
+        row2 = ctk.CTkFrame(self.action_frame, fg_color="transparent")
+        row2.pack(fill="x", pady=(0, 8))
+
+        # "选择透明区域" 按钮:进入吸管模式,点击区域后扩散填充 Alpha
+        self.pick_btn = ctk.CTkButton(
+            row2, text="选择透明区域",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=40, command=self.on_pick_transparent
+        )
+        self.pick_btn.pack(side="left", expand=True, fill="x", padx=(0, 8))
+
         # "生成 ICO 文件" 按钮
         self.generate_btn = ctk.CTkButton(
-            self.action_frame, text="生成 ICO 文件",
+            row2, text="生成 ICO 文件",
             font=ctk.CTkFont(size=15, weight="bold"),
             height=40, command=self.on_generate_ico
         )
-        self.generate_btn.pack(side="right", expand=True, fill="x", padx=(8, 0))
+        self.generate_btn.pack(side="left", expand=True, fill="x", padx=(8, 0))
+
+        # ---------- 颜色容差滑块(吸管模式下显示) ----------
+        self.tolerance_frame = ctk.CTkFrame(self.action_frame, fg_color="transparent")
+
+        ctk.CTkLabel(
+            self.tolerance_frame, text="颜色容差",
+            font=ctk.CTkFont(size=13), anchor="w", width=64
+        ).pack(side="left")
+
+        self.tolerance_slider = ctk.CTkSlider(
+            self.tolerance_frame, from_=0, to=128, number_of_steps=128,
+            command=self.on_tolerance_change
+        )
+        self.tolerance_slider.set(self.generator.ALPHA_PICK_TOLERANCE)
+        self.tolerance_slider.pack(side="left", expand=True, fill="x", padx=8)
+
+        self.tolerance_value_label = ctk.CTkLabel(
+            self.tolerance_frame, text=str(self.generator.ALPHA_PICK_TOLERANCE),
+            font=ctk.CTkFont(size=13), width=36
+        )
+        self.tolerance_value_label.pack(side="left")
+
+        # ---------- 第三行:透明区域确认操作(默认隐藏) ----------
+        self.confirm_frame = ctk.CTkFrame(self.action_frame, fg_color="transparent")
+
+        self.confirm_btn = ctk.CTkButton(
+            self.confirm_frame, text="确定应用",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=36, command=self.on_confirm_region,
+            fg_color="#28A745", hover_color="#218838"
+        )
+        self.confirm_btn.pack(side="left", expand=True, fill="x", padx=(0, 8))
+
+        self.cancel_btn = ctk.CTkButton(
+            self.confirm_frame, text="取消",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            height=36, command=self.on_cancel_region,
+            fg_color="#6C757D", hover_color="#5A6268"
+        )
+        self.cancel_btn.pack(side="left", expand=True, fill="x", padx=(8, 0))
 
     def _build_status_bar(self):
         """构建底部状态栏:显示当前状态"""
@@ -447,6 +707,10 @@ class IconGeneratorApp(BaseWindow):
             self.crop_y = 0
             self.crop_size = 0
 
+            # 新图片载入,清除吸管模式与待确认区域
+            self._clear_pending_region()
+            self._exit_pick_mode()
+
             # 极小图片提示(弹出警告,但不阻止载入)
             if self.generator.check_small_image(img):
                 messagebox.showwarning(
@@ -467,6 +731,19 @@ class IconGeneratorApp(BaseWindow):
             messagebox.showerror("载入失败", f"无法读取图片:\n{e}")
             self.set_status(f"错误:{e}", self.COLOR_ERROR)
 
+    def _current_cropped_image(self):
+        """
+        返回当前裁剪区域对应的正方形图片
+        未设置裁剪区域时按居中裁剪计算
+        """
+        if self.current_image is None:
+            return None
+        if self.crop_size > 0:
+            return self.generator.custom_crop_square(
+                self.current_image, self.crop_x, self.crop_y, self.crop_size
+            )
+        return self.generator.center_crop_square(self.current_image)
+
     def _update_previews(self):
         """更新原图预览与效果预览(256x256 带透明网格)"""
         if self.current_image is None:
@@ -476,24 +753,7 @@ class IconGeneratorApp(BaseWindow):
         self._update_canvas_preview()
 
         # ---------- 效果预览:裁剪 -> 256x256 -> 叠加透明网格 ----------
-        # 1. 使用用户选择的裁剪区域或默认居中裁剪
-        if self.crop_size > 0:
-            cropped = self.generator.custom_crop_square(
-                self.current_image, self.crop_x, self.crop_y, self.crop_size
-            )
-        else:
-            cropped = self.generator.center_crop_square(self.current_image)
-        # 2. 缩放至 256x256
-        effect = cropped.resize(self.EFFECT_PREVIEW_SIZE, LANCZOS)
-        # 3. 创建棋盘格背景(用于直观展示透明区域)
-        checker = self._create_checkerboard(self.EFFECT_PREVIEW_SIZE)
-        # 4. 将效果图叠加到棋盘格上(使用 effect 的 Alpha 通道作为 mask)
-        checker.paste(effect, (0, 0), effect)
-        # 5. 包装为 CTkImage 并显示
-        self._effect_ctk_image = ctk.CTkImage(
-            light_image=checker, size=self.EFFECT_PREVIEW_SIZE
-        )
-        self.effect_label.configure(image=self._effect_ctk_image, text="")
+        self._update_effect_preview()
 
     def _update_canvas_preview(self):
         """更新Canvas预览图和裁剪框"""
@@ -668,6 +928,11 @@ class IconGeneratorApp(BaseWindow):
             else:
                 return
 
+        # 裁剪区域即将变化,待确认的透明区域失效
+        if self.pending_region_mask is not None:
+            self._clear_pending_region()
+            self._update_effect_preview()
+
         # 记录拖动起始状态
         self.drag_start_x = x
         self.drag_start_y = y
@@ -773,15 +1038,21 @@ class IconGeneratorApp(BaseWindow):
         if self.current_image is None:
             return
 
-        # 使用用户选择的裁剪区域
-        if self.crop_size > 0:
-            cropped = self.generator.custom_crop_square(
-                self.current_image, self.crop_x, self.crop_y, self.crop_size
-            )
-        else:
-            cropped = self.generator.center_crop_square(self.current_image)
+        # 使用用户选择的裁剪区域(与主预览保持一致)
+        cropped = self._current_cropped_image()
+        if cropped is None:
+            return
 
         effect = cropped.resize(self.EFFECT_PREVIEW_SIZE, LANCZOS)
+
+        # 待确认的透明区域用洋红色半透明高亮显示
+        if self.pending_region_mask is not None:
+            region = self.pending_region_mask.resize(
+                self.EFFECT_PREVIEW_SIZE, NEAREST
+            )
+            tint = Image.new("RGBA", self.EFFECT_PREVIEW_SIZE, (255, 0, 128, 120))
+            effect = Image.composite(tint, effect.convert("RGBA"), region)
+
         checker = self._create_checkerboard(self.EFFECT_PREVIEW_SIZE)
         checker.paste(effect, (0, 0), effect)
 
@@ -789,6 +1060,168 @@ class IconGeneratorApp(BaseWindow):
             light_image=checker, size=self.EFFECT_PREVIEW_SIZE
         )
         self.effect_label.configure(image=self._effect_ctk_image, text="")
+
+    # ======================== 选择透明区域(吸管) ========================
+
+    def _current_crop_offset(self):
+        """返回当前裁剪区域在 current_image 中的左上角偏移"""
+        img_w, img_h = self.current_image.size
+        if self.crop_size > 0:
+            size = min(self.crop_size, img_w, img_h)
+            x = max(0, min(self.crop_x, img_w - size))
+            y = max(0, min(self.crop_y, img_h - size))
+            return (x, y)
+        # 未设置裁剪框时按居中裁剪计算
+        dim = min(img_w, img_h)
+        return ((img_w - dim) // 2, (img_h - dim) // 2)
+
+    def _clear_pending_region(self):
+        """清除待确认的透明区域选择(不刷新预览)"""
+        self.pending_region_mask = None
+        self.pending_region_offset = (0, 0)
+        self.pending_seeds = []
+        self.confirm_frame.pack_forget()
+
+    def _exit_pick_mode(self):
+        """退出吸管模式"""
+        self.pick_mode = False
+        self.tolerance_frame.pack_forget()
+        self.effect_label.configure(cursor="")
+
+    def _tolerance_value(self):
+        """当前滑块设定的颜色容差"""
+        return int(round(self.tolerance_slider.get()))
+
+    def on_tolerance_change(self, value):
+        """容差滑块事件:更新数值显示,并在已选区域上延迟重算"""
+        self.tolerance_value_label.configure(text=str(int(round(float(value)))))
+        if not self.pending_seeds:
+            return
+        # 拖动滑块会连续触发,做 120ms 防抖后再重算
+        if self._tolerance_job is not None:
+            self.after_cancel(self._tolerance_job)
+        self._tolerance_job = self.after(120, self._recompute_pending_region)
+
+    def _recompute_pending_region(self):
+        """用当前容差重新计算待确认区域(所有已选区域取并集)"""
+        self._tolerance_job = None
+        if not self.pending_seeds or self.current_image is None:
+            return
+
+        cropped = self._current_cropped_image()
+        if cropped is None:
+            return
+
+        mask = None
+        try:
+            for seed in self.pending_seeds:
+                region = self.generator.build_transparent_region(
+                    cropped, seed, self._tolerance_value()
+                )
+                # 多次选择取并集(加选)
+                mask = region if mask is None else ImageChops.lighter(mask, region)
+        except Exception:
+            return
+
+        if mask is None:
+            return
+        self.pending_region_mask = mask
+        self._update_effect_preview()
+
+    def on_pick_transparent(self):
+        """选择透明区域按钮事件:进入吸管模式,等待点击效果预览"""
+        if self.current_image is None:
+            messagebox.showwarning("未载入图片", "请先选择一张图片")
+            return
+
+        self._clear_pending_region()
+        self.pick_mode = True
+        self.tolerance_frame.pack(fill="x", pady=(0, 8))
+        self.effect_label.configure(cursor="crosshair")
+        self._update_effect_preview()
+        self.set_status(
+            "吸管模式:点击预览中的区域(可多次点击加选)",
+            self.COLOR_PROCESS
+        )
+
+    def on_effect_click(self, event):
+        """效果预览点击事件:取点击处颜色扩散出连通区域,并累加到已有选择"""
+        if not self.pick_mode or self.current_image is None:
+            return
+
+        cropped = self._current_cropped_image()
+        if cropped is None:
+            return
+
+        # 1. 控件坐标 -> 效果预览坐标(图像在标签内居中显示)
+        pw, ph = self.EFFECT_PREVIEW_SIZE
+        px = event.x - max(0, (self.effect_label.winfo_width() - pw) // 2)
+        py = event.y - max(0, (self.effect_label.winfo_height() - ph) // 2)
+        if not (0 <= px < pw and 0 <= py < ph):
+            return
+
+        # 2. 效果预览坐标 -> 裁剪图坐标
+        cw, ch = cropped.size
+        ix = min(cw - 1, int(px * cw / pw))
+        iy = min(ch - 1, int(py * ch / ph))
+
+        self.set_status("正在计算透明区域...", self.COLOR_PROCESS)
+        self.update_idletasks()
+
+        try:
+            region = self.generator.build_transparent_region(
+                cropped, (ix, iy), self._tolerance_value()
+            )
+        except Exception as e:
+            messagebox.showerror("选择失败", f"无法计算透明区域:\n{e}")
+            self.set_status(f"错误:{e}", self.COLOR_ERROR)
+            return
+
+        # 3. 累加选区:多次点击取并集(加选)
+        if (self.pending_region_mask is not None
+                and self.pending_region_mask.size == region.size):
+            self.pending_seeds.append((ix, iy))
+            self.pending_region_mask = ImageChops.lighter(
+                self.pending_region_mask, region
+            )
+        else:
+            # 首次选择,或裁剪区域已变化:从当前点为起点重新开始
+            self.pending_seeds = [(ix, iy)]
+            self.pending_region_mask = region
+
+        self.pending_region_offset = self._current_crop_offset()
+        self.confirm_frame.pack(fill="x")
+        self._update_effect_preview()
+        self.set_status(
+            f"已选 {len(self.pending_seeds)} 处区域(可继续点击加选),点击「确定应用」使其透明",
+            self.COLOR_SUCCESS
+        )
+
+    def on_confirm_region(self):
+        """确定应用按钮事件:把选中区域设为完全透明"""
+        if self.current_image is None or self.pending_region_mask is None:
+            return
+
+        try:
+            self.current_image = self.generator.apply_region_alpha(
+                self.current_image,
+                self.pending_region_mask,
+                self.pending_region_offset
+            )
+            self._clear_pending_region()
+            self._exit_pick_mode()
+            self._update_previews()
+            self.set_status("已将该区域设为透明", self.COLOR_SUCCESS)
+        except Exception as e:
+            messagebox.showerror("处理失败", f"设置透明区域失败:\n{e}")
+            self.set_status(f"错误:{e}", self.COLOR_ERROR)
+
+    def on_cancel_region(self):
+        """取消按钮事件:放弃本次区域选择"""
+        self._clear_pending_region()
+        self._exit_pick_mode()
+        self._update_effect_preview()
+        self.set_status("已取消选择", self.COLOR_READY)
 
     def on_window_resize(self, event):
         """窗口大小改变事件"""
@@ -812,10 +1245,63 @@ class IconGeneratorApp(BaseWindow):
         self.crop_x = (img_w - min_dim) // 2
         self.crop_y = (img_h - min_dim) // 2
 
+        # 裁剪区域变化,待确认的透明区域失效
+        self._clear_pending_region()
+
         # 更新预览
         self._update_canvas_preview()
         self._update_effect_preview()
         self.set_status("裁剪区域已重置", self.COLOR_READY)
+
+    def _apply_crop_to_image(self):
+        """把当前裁剪区域写回 current_image,并把裁剪框重置为整张图"""
+        cropped = self._current_cropped_image()
+        self.current_image = cropped
+        # 裁剪框重置为整张图片(正方形)
+        img_w, img_h = cropped.size
+        self.crop_size = min(img_w, img_h)
+        self.crop_x = (img_w - self.crop_size) // 2
+        self.crop_y = (img_h - self.crop_size) // 2
+        return cropped
+
+    def on_apply_crop(self):
+        """应用裁剪按钮事件:裁剪并写回图片,不生成 ICO"""
+        if self.current_image is None:
+            messagebox.showwarning("未载入图片", "请先选择一张图片")
+            return
+
+        try:
+            cropped = self._apply_crop_to_image()
+            # 更新原图与效果预览
+            self._update_previews()
+            self.set_status(
+                f"裁剪已应用:{cropped.width}x{cropped.height}",
+                self.COLOR_SUCCESS
+            )
+        except Exception as e:
+            messagebox.showerror("裁剪失败", f"应用裁剪失败:\n{e}")
+            self.set_status(f"错误:{e}", self.COLOR_ERROR)
+
+    def on_apply_rounded_alpha(self):
+        """添加圆角Alpha按钮事件:先应用裁剪,再叠加圆角透明通道"""
+        if self.current_image is None:
+            messagebox.showwarning("未载入图片", "请先选择一张图片")
+            return
+
+        try:
+            # 1. 先应用裁剪,保证作用于正方形图片
+            cropped = self._apply_crop_to_image()
+            # 2. 叠加圆角 Alpha 通道
+            self.current_image = self.generator.apply_rounded_alpha(cropped)
+            # 3. 更新预览(效果预览会透过棋盘格显示圆角透明区域)
+            self._update_previews()
+            self.set_status(
+                f"已添加圆角 Alpha:{cropped.width}x{cropped.height}",
+                self.COLOR_SUCCESS
+            )
+        except Exception as e:
+            messagebox.showerror("处理失败", f"添加圆角 Alpha 失败:\n{e}")
+            self.set_status(f"错误:{e}", self.COLOR_ERROR)
 
     # ======================== 事件处理 ========================
 
@@ -852,15 +1338,15 @@ class IconGeneratorApp(BaseWindow):
         self.update_idletasks()
 
         try:
-            # 准备裁剪区域参数
-            crop_region = None
-            if self.crop_size > 0:
-                crop_region = (self.crop_x, self.crop_y, self.crop_size)
-            
+            # 使用当前裁剪区域(或居中裁剪)生成 ICO
+            # current_image 已包含"应用裁剪"和"圆角 Alpha"的处理结果
+            img = self._current_cropped_image()
+            if img is None:
+                messagebox.showwarning("未载入图片", "请先选择一张图片")
+                return
+
             # 调用图像处理器生成 ICO
-            sizes = self.generator.generate_ico(
-                self.current_image_path, output_path, crop_region
-            )
+            sizes = self.generator.generate_ico(img, output_path)
             # 拼接尺寸信息用于状态显示
             size_str = ", ".join(f"{w}x{h}" for w, h in sizes)
             self.set_status(
