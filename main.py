@@ -418,7 +418,9 @@ class IconGeneratorApp(BaseWindow):
 
     # 预览区尺寸配置
     ORIGINAL_PREVIEW_BOX = (340, 340)  # 原图预览最大边界(按比例缩放适应)
-    EFFECT_PREVIEW_SIZE = (256, 256)   # 效果预览固定尺寸
+    EFFECT_PREVIEW_SIZE = (512, 512)   # 效果预览渲染尺寸(显示时按可用空间缩放)
+    EFFECT_PREVIEW_MIN = 256           # 效果预览的最小显示逻辑尺寸
+    EFFECT_PREVIEW_MAX = 512           # 效果预览的最大显示逻辑尺寸
     CHECKER_CELL = 16                  # 透明网格每格像素大小
 
     # 状态栏颜色(区分不同状态)
@@ -448,7 +450,7 @@ class IconGeneratorApp(BaseWindow):
 
         # ===== 窗口配置 =====
         self.title("图片 转 ICO 图标生成器")
-        self.geometry("800x600")
+        self.geometry("880x680")
         self.minsize(640, 480)
 
         # ===== 状态变量 =====
@@ -580,9 +582,9 @@ class IconGeneratorApp(BaseWindow):
             font=ctk.CTkFont(size=14, weight="bold")
         ).grid(row=0, column=0, pady=(10, 5))
 
-        # 右侧标题 "效果预览 (256x256)"
+        # 右侧标题 "效果预览 (输出 256x256)"
         ctk.CTkLabel(
-            self.preview_frame, text="效果预览 (256x256)",
+            self.preview_frame, text="效果预览 (输出 256x256)",
             font=ctk.CTkFont(size=14, weight="bold")
         ).grid(row=0, column=1, pady=(10, 5))
 
@@ -623,7 +625,7 @@ class IconGeneratorApp(BaseWindow):
             text_color="gray60",
             justify="center"
         )
-        self.effect_label.pack(expand=True)
+        self.effect_label.pack(expand=True, fill="both")
 
         # 吸管模式:点击效果预览取色
         self.effect_label.bind("<Button-1>", self.on_effect_click)
@@ -1131,15 +1133,17 @@ class IconGeneratorApp(BaseWindow):
         checker = self._create_checkerboard(self.EFFECT_PREVIEW_SIZE)
         checker.paste(effect, (0, 0), effect)
 
-        # 按标签可用空间限制逻辑尺寸,避免高 DPI 下图片被裁切
+        # 按标签可用空间决定显示尺寸,尽量填满又不被裁切
         # (CTkImage 的 size 是逻辑像素,实际显示时会乘以系统缩放比例)
-        preview_logical = self.EFFECT_PREVIEW_SIZE[0]
+        preview_logical = self.EFFECT_PREVIEW_MIN
         scaling = self.effect_label._get_widget_scaling()
         avail_w = self.effect_label.winfo_width() / scaling
         avail_h = self.effect_label.winfo_height() / scaling
         if avail_w > 1 and avail_h > 1:
+            fit = int(min(avail_w, avail_h))
             preview_logical = max(
-                64, min(preview_logical, int(avail_w), int(avail_h))
+                self.EFFECT_PREVIEW_MIN,
+                min(self.EFFECT_PREVIEW_MAX, fit)
             )
 
         self._effect_ctk_image = ctk.CTkImage(
@@ -1340,6 +1344,8 @@ class IconGeneratorApp(BaseWindow):
         if canvas_size == self._last_canvas_size:
             return
         self._update_canvas_preview()
+        # 预览区大小变化后重新适配效果预览尺寸
+        self._update_effect_preview()
 
     def on_reset_crop(self):
         """重置裁剪区域按钮事件"""
