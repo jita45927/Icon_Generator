@@ -490,6 +490,7 @@ class IconGeneratorApp(BaseWindow):
         self._tolerance_job = None          # 容差滑动时的延迟重算任务
         self._resize_job = None             # 窗口缩放时的延迟重绘任务
         self._last_canvas_size = (0, 0)     # 上次绘制时的画布尺寸(用于去重)
+        self._effect_ctk_image = None       # 效果预览当前使用的图片对象
 
         # ===== 构建 UI(从上到下)=====
         self._build_title()         # 1. 标题区
@@ -1130,10 +1131,29 @@ class IconGeneratorApp(BaseWindow):
         checker = self._create_checkerboard(self.EFFECT_PREVIEW_SIZE)
         checker.paste(effect, (0, 0), effect)
 
+        # 按标签可用空间限制逻辑尺寸,避免高 DPI 下图片被裁切
+        # (CTkImage 的 size 是逻辑像素,实际显示时会乘以系统缩放比例)
+        preview_logical = self.EFFECT_PREVIEW_SIZE[0]
+        scaling = self.effect_label._get_widget_scaling()
+        avail_w = self.effect_label.winfo_width() / scaling
+        avail_h = self.effect_label.winfo_height() / scaling
+        if avail_w > 1 and avail_h > 1:
+            preview_logical = max(
+                64, min(preview_logical, int(avail_w), int(avail_h))
+            )
+
         self._effect_ctk_image = ctk.CTkImage(
-            light_image=checker, size=self.EFFECT_PREVIEW_SIZE
+            light_image=checker, size=(preview_logical, preview_logical)
         )
         self.effect_label.configure(image=self._effect_ctk_image, text="")
+
+    def _effect_display_size(self):
+        """效果预览图片实际显示的物理像素尺寸"""
+        if self._effect_ctk_image is None:
+            return self.EFFECT_PREVIEW_SIZE
+        return self._effect_ctk_image._get_scaled_size(
+            self.effect_label._get_widget_scaling()
+        )
 
     # ======================== 选择透明区域(吸管) ========================
 
@@ -1228,16 +1248,17 @@ class IconGeneratorApp(BaseWindow):
             return
 
         # 1. 控件坐标 -> 效果预览坐标(图像在标签内居中显示)
-        pw, ph = self.EFFECT_PREVIEW_SIZE
-        px = event.x - max(0, (self.effect_label.winfo_width() - pw) // 2)
-        py = event.y - max(0, (self.effect_label.winfo_height() - ph) // 2)
-        if not (0 <= px < pw and 0 <= py < ph):
+        # 使用图片实际渲染尺寸(高 DPI 下会按系统缩放比例放大)
+        img_w, img_h = self._effect_display_size()
+        px = event.x - max(0, (self.effect_label.winfo_width() - img_w) // 2)
+        py = event.y - max(0, (self.effect_label.winfo_height() - img_h) // 2)
+        if not (0 <= px < img_w and 0 <= py < img_h):
             return
 
         # 2. 效果预览坐标 -> 裁剪图坐标
         cw, ch = cropped.size
-        ix = min(cw - 1, int(px * cw / pw))
-        iy = min(ch - 1, int(py * ch / ph))
+        ix = min(cw - 1, int(px * cw / img_w))
+        iy = min(ch - 1, int(py * ch / img_h))
 
         self.set_status("正在计算透明区域...", self.COLOR_PROCESS)
         self.update_idletasks()
