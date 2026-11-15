@@ -418,9 +418,7 @@ class IconGeneratorApp(BaseWindow):
 
     # 预览区尺寸配置
     ORIGINAL_PREVIEW_BOX = (340, 340)  # 原图预览最大边界(按比例缩放适应)
-    EFFECT_PREVIEW_SIZE = (512, 512)   # 效果预览渲染尺寸(显示时按可用空间缩放)
-    EFFECT_PREVIEW_MIN = 256           # 效果预览的最小显示逻辑尺寸
-    EFFECT_PREVIEW_MAX = 512           # 效果预览的最大显示逻辑尺寸
+    EFFECT_PREVIEW_SIZE = (512, 512)   # 效果预览渲染上限
     CHECKER_CELL = 16                  # 透明网格每格像素大小
 
     # 状态栏颜色(区分不同状态)
@@ -460,7 +458,8 @@ class IconGeneratorApp(BaseWindow):
 
         # 预览图引用(必须保存为实例属性,防止被 Python 垃圾回收导致图片不显示)
         self._original_ctk_image = None
-        self._effect_ctk_image = None
+        self._effect_photo = None          # 效果预览的 PhotoImage
+        self._effect_geom = None           # 效果预览绘制位置 (x, y, size)
 
         # 裁剪区域状态
         self.crop_x = 0                   # 裁剪区域左上角x坐标(原图坐标)
@@ -492,7 +491,8 @@ class IconGeneratorApp(BaseWindow):
         self._tolerance_job = None          # 容差滑动时的延迟重算任务
         self._resize_job = None             # 窗口缩放时的延迟重绘任务
         self._last_canvas_size = (0, 0)     # 上次绘制时的画布尺寸(用于去重)
-        self._effect_ctk_image = None       # 效果预览当前使用的图片对象
+        self._effect_job = None             # 效果预览延迟重绘任务
+        self._effect_canvas_size = (0, 0)   # 效果预览画布上次的尺寸
 
         # ===== 构建 UI(从上到下)=====
         self._build_title()         # 1. 标题区
@@ -617,18 +617,23 @@ class IconGeneratorApp(BaseWindow):
         self.effect_frame.grid(row=1, column=1, padx=10, pady=10, sticky="nsew")
         self.effect_frame.pack_propagate(False)
 
-        # 效果预览标签
-        self.effect_label = ctk.CTkLabel(
-            self.effect_frame,
-            text="等待图片载入",
-            font=ctk.CTkFont(size=14),
-            text_color="gray60",
-            justify="center"
+        # 效果预览画布:自行绘制图片,保证点击坐标与图像像素一一对应
+        frame_bg = self.preview_frame._apply_appearance_mode(
+            self.preview_frame.cget("fg_color")
         )
-        self.effect_label.pack(expand=True, fill="both")
+        self.effect_canvas = tk.Canvas(
+            self.effect_frame, bg=frame_bg,
+            highlightthickness=0, bd=0, cursor=""
+        )
+        self.effect_canvas.pack(expand=True, fill="both")
+        self._effect_placeholder = self.effect_canvas.create_text(
+            0, 0, text="等待图片载入",
+            fill="gray60", font=("Microsoft YaHei UI", 14)
+        )
+        self.effect_canvas.bind("<Configure>", self._on_effect_canvas_configure)
 
         # 吸管模式:点击效果预览取色
-        self.effect_label.bind("<Button-1>", self.on_effect_click)
+        self.effect_canvas.bind("<Button-1>", self.on_effect_click)
 
     def _build_action_area(self):
         """构建操作区:第一行编辑按钮,第二行透明区域与生成 ICO,第三行确认操作"""
@@ -1111,7 +1116,7 @@ class IconGeneratorApp(BaseWindow):
         self.drag_mode = None
 
     def _update_effect_preview(self):
-        """单独更新效果预览"""
+        """更新效果预览:按画布可用空间绘制,并记录绘制位置供点击换算"""
         if self.current_image is None:
             return
 
@@ -1120,44 +1125,65 @@ class IconGeneratorApp(BaseWindow):
         if cropped is None:
             return
 
-        effect = cropped.resize(self.EFFECT_PREVIEW_SIZE, LANCZOS)
+        canvas_w = self.effect_canvas.winfo_width()
+        canvas_h = self.effect_canvas.winfo_height()
+        if canvas_w <= 1 or canvas_h <= 1:
+            # 布局尚未完成,先按兜底尺寸绘制
+            canvas_w, canvas_h = 480, 480
+        # 画布上实际绘制的像素边长(1:1,不再做任何缩放补偿)
+        size = max(64, min(canvas_w, canvas_h))
+
+        effect = cropped.resize((size, size), LANCZOS)
 
         # 待确认的透明区域用洋红色半透明高亮显示
         if self.pending_region_mask is not None:
-            region = self.pending_region_mask.resize(
-                self.EFFECT_PREVIEW_SIZE, NEAREST
-            )
-            tint = Image.new("RGBA", self.EFFECT_PREVIEW_SIZE, (255, 0, 128, 120))
+            region = self.pending_region_mask.resize((size, size), NEAREST)
+            tint = Image.new("RGBA", (size, size), (255, 0, 128, 120))
             effect = Image.composite(tint, effect.convert("RGBA"), region)
 
-        checker = self._create_checkerboard(self.EFFECT_PREVIEW_SIZE)
+        checker = self._create_checkerboard((size, size))
         checker.paste(effect, (0, 0), effect)
 
-        # 按标签可用空间决定显示尺寸,尽量填满又不被裁切
-        # (CTkImage 的 size 是逻辑像素,实际显示时会乘以系统缩放比例)
-        preview_logical = self.EFFECT_PREVIEW_MIN
-        scaling = self.effect_label._get_widget_scaling()
-        avail_w = self.effect_label.winfo_width() / scaling
-        avail_h = self.effect_label.winfo_height() / scaling
-        if avail_w > 1 and avail_h > 1:
-            fit = int(min(avail_w, avail_h))
-            preview_logical = max(
-                self.EFFECT_PREVIEW_MIN,
-                min(self.EFFECT_PREVIEW_MAX, fit)
-            )
+        photo = ImageTk.PhotoImage(checker)
+        offset_x = (canvas_w - size) // 2
+        offset_y = (canvas_h - size) // 2
 
-        self._effect_ctk_image = ctk.CTkImage(
-            light_image=checker, size=(preview_logical, preview_logical)
+        self.effect_canvas.delete("all")
+        self.effect_canvas.create_image(
+            offset_x, offset_y, anchor="nw", image=photo
         )
-        self.effect_label.configure(image=self._effect_ctk_image, text="")
+        self._effect_photo = photo
+        self._effect_placeholder = None
+        self._effect_geom = (offset_x, offset_y, size)
+        self._effect_canvas_size = (
+            self.effect_canvas.winfo_width(),
+            self.effect_canvas.winfo_height(),
+        )
 
-    def _effect_display_size(self):
-        """效果预览图片实际显示的物理像素尺寸"""
-        if self._effect_ctk_image is None:
-            return self.EFFECT_PREVIEW_SIZE
-        return self._effect_ctk_image._get_scaled_size(
-            self.effect_label._get_widget_scaling()
+    def _center_effect_placeholder(self):
+        """画布尺寸变化时,把占位文字放到中间"""
+        if self._effect_placeholder is None:
+            return
+        self.effect_canvas.coords(
+            self._effect_placeholder,
+            self.effect_canvas.winfo_width() // 2,
+            self.effect_canvas.winfo_height() // 2,
         )
+
+    def _on_effect_canvas_configure(self, event):
+        """效果预览画布尺寸变化:居中占位文字,并按新尺寸重绘图片"""
+        self._center_effect_placeholder()
+        size = (event.width, event.height)
+        if size == self._effect_canvas_size:
+            return
+        self._effect_canvas_size = size
+        if self.current_image is not None and self._effect_job is None:
+            self._effect_job = self.after(120, self._redraw_effect_preview)
+
+    def _redraw_effect_preview(self):
+        """延迟重绘效果预览(合并连续的尺寸变化事件)"""
+        self._effect_job = None
+        self._update_effect_preview()
 
     # ======================== 选择透明区域(吸管) ========================
 
@@ -1184,7 +1210,7 @@ class IconGeneratorApp(BaseWindow):
         """退出吸管模式"""
         self.pick_mode = False
         self.tolerance_frame.pack_forget()
-        self.effect_label.configure(cursor="")
+        self.effect_canvas.configure(cursor="")
 
     def _tolerance_value(self):
         """当前滑块设定的颜色容差"""
@@ -1235,7 +1261,7 @@ class IconGeneratorApp(BaseWindow):
         self._clear_pending_region()
         self.pick_mode = True
         self.tolerance_frame.pack(fill="x", pady=(0, 8))
-        self.effect_label.configure(cursor="crosshair")
+        self.effect_canvas.configure(cursor="crosshair")
         self._update_effect_preview()
         self.set_status(
             "吸管模式:点击预览中的区域(可多次点击加选)",
@@ -1251,18 +1277,19 @@ class IconGeneratorApp(BaseWindow):
         if cropped is None:
             return
 
-        # 1. 控件坐标 -> 效果预览坐标(图像在标签内居中显示)
-        # 使用图片实际渲染尺寸(高 DPI 下会按系统缩放比例放大)
-        img_w, img_h = self._effect_display_size()
-        px = event.x - max(0, (self.effect_label.winfo_width() - img_w) // 2)
-        py = event.y - max(0, (self.effect_label.winfo_height() - img_h) // 2)
-        if not (0 <= px < img_w and 0 <= py < img_h):
+        # 1. 画布坐标 -> 预览图像坐标(直接使用绘制时记录的几何位置)
+        if self._effect_geom is None:
+            return
+        off_x, off_y, size = self._effect_geom
+        px = event.x - off_x
+        py = event.y - off_y
+        if not (0 <= px < size and 0 <= py < size):
             return
 
-        # 2. 效果预览坐标 -> 裁剪图坐标
+        # 2. 预览图像坐标 -> 裁剪图坐标
         cw, ch = cropped.size
-        ix = min(cw - 1, int(px * cw / img_w))
-        iy = min(ch - 1, int(py * ch / img_h))
+        ix = min(cw - 1, int(px * cw / size))
+        iy = min(ch - 1, int(py * ch / size))
 
         self.set_status("正在计算透明区域...", self.COLOR_PROCESS)
         self.update_idletasks()
@@ -1344,8 +1371,6 @@ class IconGeneratorApp(BaseWindow):
         if canvas_size == self._last_canvas_size:
             return
         self._update_canvas_preview()
-        # 预览区大小变化后重新适配效果预览尺寸
-        self._update_effect_preview()
 
     def on_reset_crop(self):
         """重置裁剪区域按钮事件"""
