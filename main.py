@@ -86,6 +86,8 @@ class IconGenerator:
 
     # "选择透明区域"的颜色容差(按最大通道差计算,0-255)
     ALPHA_PICK_TOLERANCE = 32
+    # 透明区域蒙版计算的最大边长(像素),大图按此降采样后再连通填充
+    ALPHA_PICK_MAX_SIDE = 512
 
     # 超大图片保护阈值:任一边超过此值则触发等比缩小
     MAX_INPUT_DIM = 5000
@@ -201,6 +203,17 @@ class IconGenerator:
         w, h = rgb.size
         x = max(0, min(int(xy[0]), w - 1))
         y = max(0, min(int(xy[1]), h - 1))
+
+        # 大图降采样后再做连通填充:逐像素填充耗时随面积增长,
+        # 蒙版只用于 256 尺寸图标,按上限分辨率计算后再放大不影响效果
+        scale = min(1.0, self.ALPHA_PICK_MAX_SIDE / max(w, h))
+        if scale < 1.0:
+            work_w = max(1, int(round(w * scale)))
+            work_h = max(1, int(round(h * scale)))
+            rgb = rgb.resize((work_w, work_h), Image.BILINEAR)
+            x = min(work_w - 1, int(x * work_w / w))
+            y = min(work_h - 1, int(y * work_h / h))
+
         seed = rgb.getpixel((x, y))
 
         # 逐通道计算与种子色的差值,取其最大值作为颜色距离
@@ -213,13 +226,18 @@ class IconGenerator:
             )
 
         # 阈值化为二值图:255 表示颜色与种子相近
-        similar = diff.point(lambda v: 255 if v <= tolerance else 0)
+        similar = diff.point([255 if v <= tolerance else 0 for v in range(256)])
 
         # 在二值图上做连通填充(阈值为 0,只扩散到相近像素),128 为临时标记色
         ImageDraw.floodfill(similar, (x, y), 128, thresh=0)
 
         # 取出被标记的连通区域
-        return similar.point(lambda v: 255 if v == 128 else 0)
+        region = similar.point([255 if v == 128 else 0 for v in range(256)])
+
+        # 放回原图尺寸
+        if region.size != (w, h):
+            region = region.resize((w, h), Image.NEAREST)
+        return region
 
     def apply_region_alpha(self, img, region_mask, offset=(0, 0)):
         """
@@ -470,6 +488,8 @@ class IconGeneratorApp(BaseWindow):
         self.pending_region_offset = (0, 0) # 该蒙版在 current_image 中的偏移
         self.pending_seeds = []             # 已点击的种子点列表(支持加选)
         self._tolerance_job = None          # 容差滑动时的延迟重算任务
+        self._resize_job = None             # 窗口缩放时的延迟重绘任务
+        self._last_canvas_size = (0, 0)     # 上次绘制时的画布尺寸(用于去重)
 
         # ===== 构建 UI(从上到下)=====
         self._build_title()         # 1. 标题区
@@ -817,6 +837,8 @@ class IconGeneratorApp(BaseWindow):
 
         if canvas_width <= 1 or canvas_height <= 1:
             return
+
+        self._last_canvas_size = (canvas_width, canvas_height)
 
         # 清空Canvas
         self.original_canvas.delete("all")
@@ -1281,12 +1303,22 @@ class IconGeneratorApp(BaseWindow):
         if hasattr(self, "promo_label"):
             self.promo_label.configure(wraplength=max(400, event.width - 60))
         # 延迟更新,避免频繁重绘
-        self.after(100, self._delayed_resize_update)
+        if self._resize_job is not None:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(100, self._delayed_resize_update)
 
     def _delayed_resize_update(self):
-        """延迟更新Canvas预览"""
-        if self.current_image is not None:
-            self._update_canvas_preview()
+        """延迟更新Canvas预览(仅在画布尺寸真正变化时重绘)"""
+        self._resize_job = None
+        if self.current_image is None:
+            return
+        canvas_size = (
+            self.original_canvas.winfo_width(),
+            self.original_canvas.winfo_height(),
+        )
+        if canvas_size == self._last_canvas_size:
+            return
+        self._update_canvas_preview()
 
     def on_reset_crop(self):
         """重置裁剪区域按钮事件"""
