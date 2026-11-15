@@ -22,6 +22,7 @@ import io
 import os
 import struct
 import tkinter as tk
+import webbrowser
 from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
@@ -408,6 +409,18 @@ class IconGeneratorApp(BaseWindow):
     COLOR_SUCCESS = "#28A745"    # 成功(绿)
     COLOR_ERROR = "#DC3545"      # 错误(红)
 
+    # 标题下方推广信息(点击超链接打开注册链接)
+    PROMO_URL = (
+        "https://www.trae.cn/events/code-fission/B8F6GKVM5QPU"
+        "?utm_source=copy_link&utm_medium=code_fission"
+    )
+    PROMO_TEXT = (
+        "本程序由 TRAE-IDE 辅助生成，通过我的分享链接注册并登录桌面端，"
+        "新用户一次性获得 3,000 积分！"
+    )
+    BILI_URL = "https://space.bilibili.com/1351334510"
+    BILI_TEXT = "BILIBILI-【AI马特】"
+
     def __init__(self):
         super().__init__()
 
@@ -416,7 +429,7 @@ class IconGeneratorApp(BaseWindow):
         ctk.set_default_color_theme("blue")
 
         # ===== 窗口配置 =====
-        self.title("PNG 转 ICO 图标生成器")
+        self.title("图片 转 ICO 图标生成器")
         self.geometry("800x600")
         self.minsize(640, 480)
 
@@ -482,13 +495,52 @@ class IconGeneratorApp(BaseWindow):
     # ======================== UI 构建方法 ========================
 
     def _build_title(self):
-        """构建标题区:显示程序标题"""
+        """构建标题区:显示程序标题与推广信息"""
         self.title_label = ctk.CTkLabel(
             self,
-            text="PNG 转 ICO 图标生成器",
+            text="图片 转 ICO 图标生成器",
             font=ctk.CTkFont(size=22, weight="bold")
         )
-        self.title_label.pack(pady=(15, 5))
+        self.title_label.pack(pady=(15, 2))
+
+        # 标题下方推广信息(说明文字 + 可点击的超链接)
+        promo_frame = ctk.CTkFrame(self, fg_color="transparent")
+        promo_frame.pack(pady=(0, 5))
+
+        self.promo_label = ctk.CTkLabel(
+            promo_frame,
+            text=self.PROMO_TEXT,
+            font=ctk.CTkFont(size=11),
+            text_color="#4FA3FF",
+            justify="center",
+            wraplength=720
+        )
+        self.promo_label.pack()
+
+        self.promo_link = ctk.CTkLabel(
+            promo_frame,
+            text="【注册地址】点此注册",
+            font=ctk.CTkFont(size=12, underline=True),
+            text_color="#4FA3FF",
+            cursor="hand2"
+        )
+        self.promo_link.pack(pady=(2, 0))
+        self.promo_link.bind("<Button-1>", self._open_promo_link)
+
+        # B 站主页超链接
+        self.bili_link = ctk.CTkLabel(
+            promo_frame,
+            text=self.BILI_TEXT,
+            font=ctk.CTkFont(size=12, underline=True),
+            text_color="#4FA3FF",
+            cursor="hand2"
+        )
+        self.bili_link.pack(pady=(2, 0))
+        self.bili_link.bind("<Button-1>", lambda event: webbrowser.open(self.BILI_URL))
+
+    def _open_promo_link(self, event=None):
+        """点击推广信息时用默认浏览器打开注册链接"""
+        webbrowser.open(self.PROMO_URL)
 
     def _build_preview_area(self):
         """构建预览区:左侧原图 + 右侧效果预览(带透明网格)"""
@@ -1225,6 +1277,9 @@ class IconGeneratorApp(BaseWindow):
 
     def on_window_resize(self, event):
         """窗口大小改变事件"""
+        # 推广信息随窗口宽度换行,避免文字被裁切
+        if hasattr(self, "promo_label"):
+            self.promo_label.configure(wraplength=max(400, event.width - 60))
         # 延迟更新,避免频繁重绘
         self.after(100, self._delayed_resize_update)
 
